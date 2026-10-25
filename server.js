@@ -1,0 +1,289 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const WebSocket = require('ws');
+
+const PORT = process.env.PORT || 3000;
+const WORLD = { w: 2200, h: 1500 };
+const TICK_MS = 1000 / 60;
+const SNAPSHOT_MS = 50;
+const POLICE_ESCAPE_BOOST = 1.075; // 7.5% speed while police target you
+const WATER_HEAL = 40;
+const WATER_RESPAWN_MS = 12000;
+const PLAYER_SPEED = 260;
+const PLAYER_RADIUS = 17;
+const BULLET_SPEED = 1100;
+const BULLET_RADIUS = 5;
+const BULLET_DAMAGE = 20;
+const FIRE_COOLDOWN = 125;
+const RESPAWN_MS = 1800;
+const MAX_PLAYERS = 24;
+const CHAT_COOLDOWN_MS = 650;
+const POLICE_COOLDOWN_MS = 20000;
+const POLICE_DURATION_MS = 8500;
+const POLICE_SPEED = 235;
+const POLICE_SHOT_COOLDOWN_MS = 650;
+const EMOTES = ['😂','🤡','💀','🥱','🖕','🤏'];
+const COLORS = ['#42d9ff','#ffbd4a','#b78bff','#62ed9a','#ff638b','#ff8a4c','#f4f76a','#65a6ff'];
+const players = new Map();
+const bullets = new Map();
+const policeUnits = new Map();
+let nextPlayerId = 1;
+let nextBulletId = 1;
+let nextPoliceId = 1;
+let lastSnapshot = 0;
+let nextWaterId = 1;
+const waters = [];
+const policeTargets = new Set();
+
+// Static cover. Coordinates are world-space rectangles.
+const obstacles = [
+  {x:300,y:220,w:230,h:70,type:'crate'}, {x:660,y:170,w:80,h:260,type:'wall'},
+  {x:960,y:260,w:270,h:75,type:'crate'}, {x:1510,y:180,w:100,h:280,type:'wall'},
+  {x:1820,y:280,w:170,h:80,type:'crate'}, {x:230,y:650,w:100,h:280,type:'wall'},
+  {x:510,y:790,w:220,h:75,type:'crate'}, {x:900,y:600,w:90,h:290,type:'wall'},
+  {x:1120,y:760,w:260,h:75,type:'crate'}, {x:1590,y:650,w:100,h:300,type:'wall'},
+  {x:1840,y:990,w:180,h:80,type:'crate'}, {x:330,y:1190,w:250,h:75,type:'crate'},
+  {x:740,y:1110,w:90,h:250,type:'wall'}, {x:1050,y:1230,w:250,h:75,type:'crate'},
+  {x:1410,y:1120,w:90,h:240,type:'wall'}, {x:1710,y:1210,w:240,h:70,type:'crate'},
+  {x:1000,y:440,w:70,h:90,type:'barrel'}, {x:1300,y:450,w:70,h:90,type:'barrel'},
+  {x:430,y:480,w:70,h:90,type:'barrel'}, {x:1760,y:510,w:70,h:90,type:'barrel'},
+  {x:780,y:930,w:70,h:90,type:'barrel'}, {x:1370,y:950,w:70,h:90,type:'barrel'}
+];
+
+function send(ws, data) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+}
+function rand(min, max) { return min + Math.random() * (max - min); }
+function circleRect(cx, cy, r, rect) {
+  const x = Math.max(rect.x, Math.min(cx, rect.x + rect.w));
+  const y = Math.max(rect.y, Math.min(cy, rect.y + rect.h));
+  const dx = cx - x, dy = cy - y;
+  return dx * dx + dy * dy < r * r;
+}
+function blocked(x, y, r = PLAYER_RADIUS) {
+  if (x < r || y < r || x > WORLD.w-r || y > WORLD.h-r) return true;
+  return obstacles.some(o => circleRect(x, y, r, o));
+}
+function createWater() {
+  for (let i = 0; i < 100; i++) {
+    const x = rand(55, WORLD.w-55), y = rand(55, WORLD.h-55);
+    if (!blocked(x,y,24) && !waters.some(w=>Math.hypot(w.x-x,w.y-y)<130)) {
+      waters.push({id:nextWaterId++,x,y,active:true,readyAt:0}); return;
+    }
+  }
+}
+for (let i=0;i<10;i++) createWater();
+function spawn(p) {
+  let x, y, tries = 0;
+  do {
+    x = rand(80, WORLD.w - 80);
+    y = rand(80, WORLD.h - 80);
+    tries++;
+  } while ((blocked(x,y) || [...players.values()].some(q => q.id !== p.id && q.alive && Math.hypot(q.x-x,q.y-y) < 100)) && tries < 300);
+  p.x = x; p.y = y; p.vx = 0; p.vy = 0;
+  p.hp = 100; p.alive = true; p.respawnAt = 0;
+  p.aim = 0; p.lastShot = 0; p.invulnerableUntil = Date.now() + 1200;
+}
+function eliminate(p, killerId = null) {
+  if (!p.alive) return;
+  p.alive = false; p.hp = 0; p.respawnAt = Date.now() + RESPAWN_MS;
+  if (killerId && players.has(killerId) && killerId !== p.id) players.get(killerId).kills++;
+  p.deaths++;
+}
+function circleHitsSegment(px, py, r, x1, y1, x2, y2) {
+  const dx = x2-x1, dy = y2-y1;
+  const len2 = dx*dx + dy*dy || 1;
+  const t = Math.max(0, Math.min(1, ((px-x1)*dx+(py-y1)*dy)/len2));
+  return Math.hypot(px-(x1+t*dx), py-(y1+t*dy)) <= r;
+}
+
+
+function segmentRect(x1,y1,x2,y2,r,o) {
+  // Slab intersection with an expanded rectangle (swept bullet collision).
+  const minX=o.x-r,maxX=o.x+o.w+r,minY=o.y-r,maxY=o.y+o.h+r;
+  let t0=0,t1=1;
+  for (const [p,d,lo,hi] of [[x1,x2-x1,minX,maxX],[y1,y2-y1,minY,maxY]]) {
+    if(Math.abs(d)<1e-8){if(p<lo||p>hi)return Infinity;continue;}
+    const a=(lo-p)/d,b=(hi-p)/d;
+    t0=Math.max(t0,Math.min(a,b));t1=Math.min(t1,Math.max(a,b));
+    if(t0>t1)return Infinity;
+  }
+  return t0;
+}
+function segmentCircleT(x1,y1,x2,y2,cx,cy,r){
+  const dx=x2-x1,dy=y2-y1,fx=x1-cx,fy=y1-cy;
+  const a=dx*dx+dy*dy,b=2*(fx*dx+fy*dy),c=fx*fx+fy*fy-r*r;
+  if(c<=0)return 0;
+  const disc=b*b-4*a*c;
+  if(disc<0||a===0)return Infinity;
+  const t=(-b-Math.sqrt(disc))/(2*a);
+  return t>=0&&t<=1?t:Infinity;
+}
+
+const server = http.createServer((req, res) => {
+  const pathname = (req.url || '/').split('?')[0];
+  if (pathname === '/' || pathname === '/index.html') {
+    res.writeHead(200, {'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});
+    fs.createReadStream(path.join(__dirname, 'index.html')).pipe(res);
+  } else if (pathname === '/health') {
+    res.writeHead(200, {'Content-Type':'application/json'});
+    res.end(JSON.stringify({ok:true, players:players.size}));
+  } else { res.writeHead(404); res.end('Not found'); }
+});
+const wss = new WebSocket.Server({server, perMessageDeflate:false});
+wss.on('connection', ws => {
+  if (players.size >= MAX_PLAYERS) { send(ws,{type:'error',message:'Serverul este plin. Încearcă mai târziu.'}); ws.close(); return; }
+  const id = nextPlayerId++;
+  const p = {id,ws,name:`Player ${id}`,color:COLORS[(id-1)%COLORS.length],x:100,y:100,vx:0,vy:0,hp:100,alive:true,kills:0,deaths:0,aim:0,keys:{},lastShot:0,respawnAt:0,invulnerableUntil:0,lastInput:Date.now(),lastChat:0,lastEmote:0,emote:'',emoteUntil:0,lastPoliceCall:0,policeReadyAt:0,};
+  players.set(id,p); spawn(p);
+  send(ws,{type:'welcome',id,world:WORLD,obstacles});
+  ws.on('message', raw => {
+    if (raw.length > 2048) return;
+    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
+    if (m.type === 'name' && typeof m.name === 'string') p.name = m.name.trim().slice(0,16) || p.name;
+    if (m.type === 'input') {
+      const k = m.keys || {};
+      p.keys = {up:!!k.up,down:!!k.down,left:!!k.left,right:!!k.right,fire:!!k.fire};
+      if (Number.isFinite(m.aim)) p.aim = m.aim;
+      p.lastInput = Date.now();
+    }
+
+    if (m.type === 'chat' && typeof m.text === 'string') {
+      const now = Date.now();
+      const text = m.text.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 180);
+      if (text && now - p.lastChat >= CHAT_COOLDOWN_MS) {
+        p.lastChat = now;
+        const packet = JSON.stringify({type:'chat',id:p.id,name:p.name,color:p.color,text,at:now});
+        for (const q of players.values()) if (q.ws.readyState === WebSocket.OPEN && q.ws.bufferedAmount < 100_000) q.ws.send(packet);
+      }
+    }
+    if (m.type === 'emote' && EMOTES.includes(m.value) && Date.now() - p.lastEmote > 450) {
+      p.lastEmote = Date.now(); p.emote = m.value; p.emoteUntil = Date.now() + 1800;
+      const packet = JSON.stringify({type:'emote',id:p.id,value:p.emote,until:p.emoteUntil});
+      for (const q of players.values()) if (q.ws.readyState === WebSocket.OPEN && q.ws.bufferedAmount < 100_000) q.ws.send(packet);
+    }
+    if (m.type === 'police') {
+      const now = Date.now();
+      if (!p.alive) { send(ws, {type:'policeResult', ok:false, message:'Trebuie să fii în viață ca să chemi poliția.'}); return; }
+      if (now < p.policeReadyAt) { send(ws, {type:'policeResult', ok:false, readyAt:p.policeReadyAt, message:'Poliția este încă pe drum. Așteaptă cooldown-ul.'}); return; }
+      p.lastPoliceCall = now;
+      p.policeReadyAt = now + POLICE_COOLDOWN_MS;
+      const unitId = nextPoliceId++;
+      policeUnits.set(unitId, {id:unitId, ownerId:p.id, x:p.x + rand(-38,38), y:p.y + rand(-38,38), aim:0, until:now + POLICE_DURATION_MS, lastShot:0});
+      const packet = JSON.stringify({type:'notice', text:`🚔 ${p.name} a chemat poliția!`});
+      for (const q of players.values()) if (q.ws.readyState === WebSocket.OPEN && q.ws.bufferedAmount < 100_000) q.ws.send(packet);
+      send(ws, {type:'policeResult', ok:true, readyAt:p.policeReadyAt, message:'Poliția a fost chemată!'});
+    }
+  });
+  ws.on('close', () => { players.delete(id); for (const [bid,b] of bullets) if (b.ownerId === id) bullets.delete(bid); });
+  ws.on('error', () => {});
+});
+
+let previous = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const dt = Math.min(0.05, (now - previous) / 1000);
+  previous = now;
+
+  policeTargets.clear();
+  for (const cop of policeUnits.values()) {
+    let nearest=null, dist=700;
+    for (const p of players.values()) {
+      if (!p.alive || p.id===cop.ownerId) continue;
+      const d=Math.hypot(p.x-cop.x,p.y-cop.y);
+      if(d<dist){nearest=p;dist=d;}
+    }
+    if(nearest)policeTargets.add(nearest.id);
+  }
+  for (const p of players.values()) {
+    if (!p.alive) {
+      if (now >= p.respawnAt) spawn(p);
+      continue;
+    }
+    let dx = (p.keys.right ? 1 : 0) - (p.keys.left ? 1 : 0);
+    let dy = (p.keys.down ? 1 : 0) - (p.keys.up ? 1 : 0);
+    const mag = Math.hypot(dx,dy) || 1;
+    dx /= mag; dy /= mag;
+    const speed = PLAYER_SPEED * (policeTargets.has(p.id) ? POLICE_ESCAPE_BOOST : 1);
+    const nx = p.x + dx * speed * dt;
+    const ny = p.y + dy * speed * dt;
+    // Axis-separated collision lets players slide along walls.
+    if (!blocked(nx, p.y)) p.x = nx;
+    if (!blocked(p.x, ny)) p.y = ny;
+
+    if (p.keys.fire && now - p.lastShot >= FIRE_COOLDOWN) {
+      p.lastShot = now;
+      const a = p.aim;
+      const sx = p.x + Math.cos(a) * (PLAYER_RADIUS + 9);
+      const sy = p.y + Math.sin(a) * (PLAYER_RADIUS + 9);
+      bullets.set(nextBulletId, {id:nextBulletId++,ownerId:p.id,x:sx,y:sy,vx:Math.cos(a)*BULLET_SPEED,vy:Math.sin(a)*BULLET_SPEED,life:1.25,damage:BULLET_DAMAGE,color:p.color});
+    }
+  }
+
+  // Healing bottles are server-authoritative and respawn after pickup.
+  for (const w of waters) {
+    if (!w.active && now >= w.readyAt) w.active = true;
+    if (!w.active) continue;
+    for (const p of players.values()) {
+      if (p.alive && p.hp < 100 && Math.hypot(p.x-w.x,p.y-w.y)<31) {
+        p.hp = Math.min(100,p.hp+WATER_HEAL);
+        w.active = false; w.readyAt = now+WATER_RESPAWN_MS;
+        send(p.ws,{type:'heal',amount:WATER_HEAL});
+        break;
+      }
+    }
+  }
+  // Police units briefly chase and shoot the closest opponent of the caller.
+  for (const [id, cop] of policeUnits) {
+    if (now >= cop.until || !players.has(cop.ownerId) || !players.get(cop.ownerId).alive) {
+      policeUnits.delete(id);
+      continue;
+    }
+    const owner = players.get(cop.ownerId);
+    let target = null, best = Infinity;
+    for (const candidate of players.values()) {
+      if (!candidate.alive || candidate.id === cop.ownerId) continue;
+      const dist = Math.hypot(candidate.x - cop.x, candidate.y - cop.y);
+      if (dist < best) { best = dist; target = candidate; }
+    }
+    if (!target) continue;
+    const dx = target.x - cop.x, dy = target.y - cop.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    cop.aim = Math.atan2(dy, dx);
+    if (dist > 175) {
+      const nx = cop.x + dx / dist * POLICE_SPEED * dt;
+      const ny = cop.y + dy / dist * POLICE_SPEED * dt;
+      if (!blocked(nx, cop.y, 15)) cop.x = nx;
+      if (!blocked(cop.x, ny, 15)) cop.y = ny;
+    }
+    if (dist < 520 && now - cop.lastShot >= POLICE_SHOT_COOLDOWN_MS) {
+      cop.lastShot = now;
+      const a = cop.aim;
+      bullets.set(nextBulletId, {id:nextBulletId++,ownerId:cop.ownerId,source:'police',x:cop.x+Math.cos(a)*19,y:cop.y+Math.sin(a)*19,vx:Math.cos(a)*BULLET_SPEED*0.78,vy:Math.sin(a)*BULLET_SPEED*0.78,life:0.9,damage:12,color:'#78aaff'});
+    }
+  }
+
+  for (const [id,b] of bullets) {
+    const ox=b.x,oy=b.y,nx=ox+b.vx*dt,ny=oy+b.vy*dt;
+    b.life-=dt;
+    let first=1, victim=null, wall=false;
+    for(const o of obstacles){const t=segmentRect(ox,oy,nx,ny,BULLET_RADIUS,o);if(t<first){first=t;victim=null;wall=true;}}
+    for(const p of players.values()){
+      if(!p.alive||p.id===b.ownerId||now<p.invulnerableUntil)continue;
+      const t=segmentCircleT(ox,oy,nx,ny,p.x,p.y,PLAYER_RADIUS+BULLET_RADIUS);
+      if(t<first){first=t;victim=p;wall=false;}
+    }
+    b.x=ox+(nx-ox)*first;b.y=oy+(ny-oy)*first;
+    if(victim){victim.hp-=b.damage;if(victim.hp<=0)eliminate(victim,b.ownerId);}
+    if(first<1||b.life<=0||b.x<0||b.y<0||b.x>WORLD.w||b.y>WORLD.h)bullets.delete(id);
+  }
+
+  if (now - lastSnapshot >= SNAPSHOT_MS) {
+    lastSnapshot = now;
+    const state = JSON.stringify({type:'state',time:now,players:[...players.values()].map(p=>({id:p.id,name:p.name,color:p.color,x:p.x,y:p.y,hp:p.hp,alive:p.alive,kills:p.kills,deaths:p.deaths,aim:p.aim,invulnerable:now<p.invulnerableUntil,emote:p.emoteUntil>now?p.emote:'',emoteUntil:p.emoteUntil,policeReadyAt:p.policeReadyAt,boosted:policeTargets.has(p.id)})),waters:waters.filter(w=>w.active).map(w=>({id:w.id,x:w.x,y:w.y})),bullets:[...bullets.values()].map(b=>({id:b.id,x:b.x,y:b.y,vx:b.vx,vy:b.vy,color:b.color,source:b.source||'player'})),police:[...policeUnits.values()].map(c=>({id:c.id,x:c.x,y:c.y,aim:c.aim,ownerId:c.ownerId,until:c.until})),count:players.size});
+    for (const p of players.values()) if (p.ws.readyState === WebSocket.OPEN && p.ws.bufferedAmount < 1_000_000) p.ws.send(state);
+  }
+}, TICK_MS);
+
+server.listen(PORT, '0.0.0.0', () => console.log(`Shooter server listening on ${PORT}`));
